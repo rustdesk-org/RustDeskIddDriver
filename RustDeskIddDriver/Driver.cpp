@@ -185,6 +185,17 @@ WDF_DECLARE_CONTEXT_TYPE(IndirectDeviceContextWrapper);
 
 WDF_DECLARE_CONTEXT_TYPE(IndirectMonitorContextWrapper);
 
+static WDF_OBJECT_ATTRIBUTES CreateMonitorObjectAttributes()
+{
+    WDF_OBJECT_ATTRIBUTES attributes;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, IndirectMonitorContextWrapper);
+    attributes.EvtCleanupCallback = [](WDFOBJECT monitor)
+    {
+        WdfObjectGet_IndirectMonitorContextWrapper(monitor)->Cleanup();
+    };
+    return attributes;
+}
+
 extern "C" BOOL WINAPI DllMain(
     _In_ HINSTANCE hInstance,
     _In_ UINT dwReason,
@@ -475,6 +486,52 @@ void SwapChainProcessor::Run()
     AvRevertMmThreadCharacteristics(AvTaskHandle);
 }
 
+static bool CompleteDiscardedFrame(IDDCX_SWAPCHAIN swapChain, const IDDCX_METADATA& metadata)
+{
+    LARGE_INTEGER acquireTime = {};
+    QueryPerformanceCounter(&acquireTime);
+
+    ComPtr<IDXGIResource> acquiredBuffer;
+    acquiredBuffer.Attach(metadata.pSurface);
+    acquiredBuffer.Reset();
+
+    const HRESULT finishResult = IddCxSwapChainFinishedProcessingFrame(swapChain);
+    if (FAILED(finishResult))
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
+            "%!FUNC! cannot finish processing frame %!HRESULT!", finishResult);
+        return false;
+    }
+
+    // IddCx rejects a statistics report without a nonzero presentation frame number.
+    if (metadata.PresentationFrameNumber == 0)
+    {
+        TraceEvents(TRACE_LEVEL_RESERVED7, TRACE_DRIVER,
+            "%!FUNC! frame completed without a presentation number; no statistics reported");
+        return true;
+    }
+
+    // This virtual display discards the acquired surface without encoding or transmitting it.
+    constexpr UINT unslicedFrameCount = 1;
+    IDARG_IN_REPORTFRAMESTATISTICS report = {};
+    auto& statistics = report.FrameStatistics;
+    statistics.Size = sizeof(statistics);
+    statistics.PresentationFrameNumber = metadata.PresentationFrameNumber;
+    statistics.FrameStatus = IDDCX_FRAME_STATUS_DROPPED;
+    statistics.FrameSliceTotal = unslicedFrameCount;
+    statistics.FrameAcquireQpcTime = static_cast<UINT64>(acquireTime.QuadPart);
+
+    const NTSTATUS reportStatus = IddCxSwapChainReportFrameStatistics(swapChain, &report);
+    if (!NT_SUCCESS(reportStatus))
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
+            "%!FUNC! cannot report frame statistics %!STATUS!", reportStatus);
+        return false;
+    }
+
+    return true;
+}
+
 void SwapChainProcessor::RunCore()
 {
     // Get the DXGI device interface
@@ -507,8 +564,6 @@ void SwapChainProcessor::RunCore()
     // Acquire and release buffers in a loop
     for (;;)
     {
-        ComPtr<IDXGIResource> AcquiredBuffer;
-
         // Ask for the next buffer from the producer
         IDARG_OUT_RELEASEANDACQUIREBUFFER Buffer = {};
         hr = IddCxSwapChainReleaseAndAcquireBuffer(m_hSwapChain, &Buffer);
@@ -550,47 +605,10 @@ void SwapChainProcessor::RunCore()
         }
         else if (SUCCEEDED(hr))
         {
-            // We have new frame to process, the surface has a reference on it that the driver has to release
-            AcquiredBuffer.Attach(Buffer.MetaData.pSurface);
-
-            // ==============================
-            // TODO: Process the frame here
-            //
-            // This is the most performance-critical section of code in an IddCx driver. It's important that whatever
-            // is done with the acquired surface be finished as quickly as possible. This operation could be:
-            //  * a GPU copy to another buffer surface for later processing (such as a staging surface for mapping to CPU memory)
-            //  * a GPU encode operation
-            //  * a GPU VPBlt to another surface
-            //  * a GPU custom compute shader encode operation
-            // ==============================
-
-            // We have finished processing this frame hence we release the reference on it.
-            // If the driver forgets to release the reference to the surface, it will be leaked which results in the
-            // surfaces being left around after swapchain is destroyed.
-            // NOTE: Although in this sample we release reference to the surface here; the driver still
-            // owns the Buffer.MetaData.pSurface surface until IddCxSwapChainReleaseAndAcquireBuffer returns
-            // S_OK and gives us a new frame, a driver may want to use the surface in future to re-encode the desktop 
-            // for better quality if there is no new frame for a while
-            AcquiredBuffer.Reset();
-            
-            // Indicate to OS that we have finished inital processing of the frame, it is a hint that
-            // OS could start preparing another frame
-            hr = IddCxSwapChainFinishedProcessingFrame(m_hSwapChain);
-            if (FAILED(hr))
+            if (!CompleteDiscardedFrame(m_hSwapChain, Buffer.MetaData))
             {
-                TraceEvents(TRACE_LEVEL_ERROR,
-                    TRACE_DRIVER,
-                    "%!FUNC! cannot finish processing frame %!HRESULT!",
-                    hr);
                 break;
             }
-
-            // ==============================
-            // TODO: Report frame statistics once the asynchronous encode/send work is completed
-            //
-            // Drivers should report information about sub-frame timings, like encode time, send time, etc.
-            // ==============================
-            // IddCxSwapChainReportFrameStatistics(m_hSwapChain, ...);
         }
         else
         {
@@ -699,8 +717,7 @@ void IndirectDeviceContext::InitAdapter()
 
 void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
 {
-    WDF_OBJECT_ATTRIBUTES Attr;
-    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attr, IndirectMonitorContextWrapper);
+    WDF_OBJECT_ATTRIBUTES Attr = CreateMonitorObjectAttributes();
 
     // In the sample driver, we report a monitor right away but a real driver would do this when a monitor connection event occurs
     IDDCX_MONITOR_INFO MonitorInfo = {};
@@ -818,8 +835,7 @@ NTSTATUS IndirectDeviceContext::PlugInMonitor(PCtlPlugIn Param)
         return STATUS_ERROR_MONITOR_EXISTS;
     }
 
-    WDF_OBJECT_ATTRIBUTES Attr;
-    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attr, IndirectMonitorContextWrapper);
+    WDF_OBJECT_ATTRIBUTES Attr = CreateMonitorObjectAttributes();
 
     // In the sample driver, we report a monitor right away but a real driver would do this when a monitor connection event occurs
     IDDCX_MONITOR_INFO MonitorInfo = {};
